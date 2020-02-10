@@ -7,6 +7,7 @@ using Mono.Unix.Native;
 using NLog;
 using NzbDrone.Common.Disk;
 using NzbDrone.Common.EnsureThat;
+using NzbDrone.Common.EnvironmentInfo;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Instrumentation;
 
@@ -16,6 +17,7 @@ namespace NzbDrone.Mono.Disk
     {
         private static readonly Logger Logger = NzbDroneLogger.GetLogger(typeof(DiskProvider));
 
+        private readonly Logger _logger;
         private readonly IProcMountProvider _procMountProvider;
         private readonly ISymbolicLinkResolver _symLinkResolver;
 
@@ -23,10 +25,11 @@ namespace NzbDrone.Mono.Disk
         // `unchecked((uint)-1)` and `uint.MaxValue` are the same thing.
         private const uint UNCHANGED_ID = uint.MaxValue;
 
-        public DiskProvider(IProcMountProvider procMountProvider, ISymbolicLinkResolver symLinkResolver)
+        public DiskProvider(IProcMountProvider procMountProvider, ISymbolicLinkResolver symLinkResolver, Logger logger)
         {
             _procMountProvider = procMountProvider;
             _symLinkResolver = symLinkResolver;
+            _logger = logger;
         }
 
         public override IMount GetMount(string path)
@@ -166,12 +169,121 @@ namespace NzbDrone.Mono.Disk
                     newFile.CreateSymbolicLinkTo(fullPath);
                 }
             }
+            else if (PlatformInfo.GetVersion() > new Version(6, 0) && (!FileExists(destination) || overwrite))
+            {
+                CopyFileChecked(source, destination, overwrite);
+            }
             else
             {
                 base.CopyFileInternal(source, destination, overwrite);
             }
         }
 
+        private void CopyFileChecked(string source, string destination, bool overwrite)
+        {
+            // Mono 6.x throws errors if permissions or timestamps cannot be set
+            // - In 6.0 it'll leave a full length file
+            // - In 6.6 it'll leave a zero length file
+            // Catch the exception and attempt to handle these edgecases
+
+            // Our check depends on the destination not existing
+            if (FileExists(destination) && overwrite)
+            {
+                DeleteFile(destination);
+            }
+
+            try
+            {
+                base.CopyFileInternal(source, destination, overwrite);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                var srcInfo = new FileInfo(source);
+                var dstInfo = new FileInfo(destination);
+                var exists = dstInfo.Exists && srcInfo.Exists;
+                if (exists && dstInfo.Length == 0 && srcInfo.Length != 0)
+                {
+                    // mono >=6.6 bug: zero length file since chmod happens at the start
+                    _logger.Debug("Mono failed to copy file likely due to known mono bug, attempting to copy directly '{0}' -> '{1}'", source, destination);
+
+                    try
+                    {
+                        _logger.Trace("Copying content from {0} to {1} ({2} bytes)", source, destination, srcInfo.Length);
+                        using (var srcStream = new FileStream(source, FileMode.Open, FileAccess.Read))
+                        using (var dstStream = new FileStream(destination, FileMode.Create, FileAccess.Write))
+                        {
+                            srcStream.CopyTo(dstStream);
+                        }
+                    }
+                    catch
+                    {
+                        // If it fails again then bail
+                        throw;
+                    }
+
+                    try
+                    {
+                        dstInfo.LastWriteTimeUtc = srcInfo.LastWriteTimeUtc;
+                    }
+                    catch
+                    {
+                        _logger.Debug("Unable to change last modified date for {0}, skipping.", destination);
+                    }
+                }
+                else if (exists && dstInfo.Length == srcInfo.Length)
+                {
+                    // mono 6.0, 6.4 bug: full length file since utime and chmod happens at the end
+                    _logger.Debug("Mono failed to copy file likely due to known mono bug, attempting to copy directly '{0}' -> '{1}'", source, destination);
+
+                    // Don't take risks, UnauthorizedAccess can happen due to various reasons. Check the file.
+                    var checkLength = (int)Math.Min(64 * 1204, dstInfo.Length);
+                    if (checkLength > 0)
+                    {
+                        var srcData = new byte[checkLength];
+                        var dstData = new byte[checkLength];
+
+                        _logger.Trace("Checking last {0} bytes in {1}", checkLength, destination);
+
+                        using (var srcStream = new FileStream(source, FileMode.Open, FileAccess.Read))
+                        using (var dstStream = new FileStream(destination, FileMode.Open, FileAccess.Read))
+                        {
+                            srcStream.Position = srcInfo.Length - checkLength;
+                            dstStream.Position = dstInfo.Length - checkLength;
+
+                            srcStream.Read(srcData, 0, checkLength);
+                            dstStream.Read(dstData, 0, checkLength);
+                        }
+
+                        for (var i = 0; i < checkLength; i++)
+                        {
+                            if (srcData[i] != dstData[i])
+                            {
+                                // Files aren't the same, the UnauthorizedAccess was unrelated
+                                _logger.Trace("Copy was incomplete, rethrowing original error");
+                                throw;
+                            }
+                        }
+
+                        _logger.Trace("Copy was complete, finishing copy ourselves");
+                    }
+
+                    try
+                    {
+                        dstInfo.LastWriteTimeUtc = srcInfo.LastWriteTimeUtc;
+                    }
+                    catch
+                    {
+                        _logger.Debug("Unable to change last modified date for {0}, skipping.", destination);
+                    }
+                }
+                else
+                {
+                    // Unrecognized situation, the UnauthorizedAccess was unrelated
+                    throw;
+                }
+            }
+        }
+        
         protected override void MoveFileInternal(string source, string destination)
         {
             var sourceInfo = UnixFileSystemInfo.GetFileSystemEntry(source);
@@ -207,9 +319,116 @@ namespace NzbDrone.Mono.Disk
                     throw;
                 }
             }
+            else if (PlatformInfo.GetVersion() > new Version(6, 0) && !FileExists(destination))
+            {
+                MoveFileChecked(source, destination);
+            }
             else
             {
                 base.MoveFileInternal(source, destination);
+            }
+        }
+
+        private void MoveFileChecked(string source, string destination)
+        {
+            // Mono 6.x throws errors if permissions or timestamps cannot be set
+            // - In 6.0 it'll leave a full length file
+            // - In 6.6 it'll leave a zero length file
+            // Catch the exception and attempt to handle these edgecases
+            
+            try
+            {
+                base.MoveFileInternal(source, destination);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                var srcInfo = new FileInfo(source);
+                var dstInfo = new FileInfo(destination);
+                var exists = dstInfo.Exists && srcInfo.Exists;
+                if (exists && dstInfo.Length == 0 && srcInfo.Length != 0)
+                {
+                    // mono >=6.6 bug: zero length file since chmod happens at the start
+                    _logger.Debug("Mono failed to move file likely due to known mono bug, attempting to copy&move directly. '{0}' -> '{1}'", source, destination);
+
+                    try
+                    {
+                        _logger.Trace("Copying content from {0} to {1} ({2} bytes)", source, destination, srcInfo.Length);
+                        using (var srcStream = new FileStream(source, FileMode.Open, FileAccess.Read))
+                        using (var dstStream = new FileStream(destination, FileMode.Create, FileAccess.Write))
+                        {
+                            srcStream.CopyTo(dstStream);
+                        }
+                    }
+                    catch
+                    {
+                        // If it fails again then bail
+                        throw;
+                    }
+
+                    try
+                    {
+                        dstInfo.LastWriteTimeUtc = srcInfo.LastWriteTimeUtc;
+                    }
+                    catch
+                    {
+                        _logger.Debug("Unable to change last modified date for {0}, skipping.", destination);
+                    }
+
+                    File.Delete(source);
+                }
+                else if (exists && dstInfo.Length == srcInfo.Length)
+                {
+                    // mono 6.0, 6.4 bug: full length file since utime and chmod happens at the end
+                    _logger.Debug("Mono failed to move file likely due to known mono bug, attempting to copy&move directly. '{0}' -> '{1}'", source, destination);
+
+                    // Check at least part of the file since UnauthorizedAccess can happen due to legitimate reasons too
+                    var checkLength = (int)Math.Min(64 * 1204, dstInfo.Length);
+                    if (checkLength > 0)
+                    {
+                        var srcData = new byte[checkLength];
+                        var dstData = new byte[checkLength];
+
+                        _logger.Trace("Check last {0} bytes from {1}", checkLength, destination);
+
+                        using (var srcStream = new FileStream(source, FileMode.Open, FileAccess.Read))
+                        using (var dstStream = new FileStream(destination, FileMode.Open, FileAccess.Read))
+                        {
+                            srcStream.Position = srcInfo.Length - checkLength;
+                            dstStream.Position = dstInfo.Length - checkLength;
+
+                            srcStream.Read(srcData, 0, checkLength);
+                            dstStream.Read(dstData, 0, checkLength);
+                        }
+
+                        for (var i = 0; i < checkLength; i++)
+                        {
+                            if (srcData[i] != dstData[i])
+                            {
+                                // Files aren't the same, the UnauthorizedAccess was unrelated
+                                _logger.Trace("Copy was incomplete, rethrowing original error");
+                                throw;
+                            }
+                        }
+
+                        _logger.Trace("Copy was complete, finishing move operation");
+                    }
+
+                    try
+                    {
+                        dstInfo.LastWriteTimeUtc = srcInfo.LastWriteTimeUtc;
+                    }
+                    catch
+                    {
+                        _logger.Debug("Unable to change last modified date for {0}, skipping.", destination);
+                    }
+
+                    File.Delete(source);
+                }
+                else
+                {
+                    // Unrecognized situation, the UnauthorizedAccess was unrelated
+                    throw;
+                }
             }
         }
 
